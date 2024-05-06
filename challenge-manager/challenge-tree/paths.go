@@ -9,7 +9,54 @@ import (
 	protocol "github.com/OffchainLabs/bold/chain-abstraction"
 	"github.com/OffchainLabs/bold/containers"
 	"github.com/OffchainLabs/bold/containers/option"
+	"github.com/pkg/errors"
 )
+
+type ComputePathWeightArgs struct {
+	Child    protocol.EdgeId
+	Ancestor protocol.EdgeId
+	BlockNum uint64
+}
+
+func (ht *RoyalChallengeTree) ComputePathWeight(
+	ctx context.Context,
+	args ComputePathWeightArgs,
+) (uint64, error) {
+	child, ok := ht.edges.TryGet(args.Child)
+	if !ok {
+		return 0, fmt.Errorf("child edge not yet tracked %#x", args.Child.Hash)
+	}
+	ancestor, ok := ht.edges.TryGet(args.Ancestor)
+	if !ok {
+		return 0, fmt.Errorf("ancestor not yet tracked %#x", args.Ancestor.Hash)
+	}
+	pathWeight := uint64(0)
+	curr := protocol.ReadOnlyEdge(ancestor)
+	for curr.Id() != child.Id() {
+		localTimer, err := ht.LocalTimer(curr, args.BlockNum)
+		if err != nil {
+			return 0, err
+		}
+		pathWeight += localTimer
+
+		hasChildren, err := curr.HasChildren(ctx)
+		if err != nil {
+			return 0, err
+		}
+		isClaimed, claimingEdge := ht.isClaimedEdge(ctx, curr)
+		if err != nil {
+			return 0, err
+		}
+		if hasChildren {
+
+		} else if isClaimed {
+			curr = claimingEdge
+		} else {
+			return 0, errors.New("child is not ancestor of specified edge")
+		}
+	}
+	return pathWeight, nil
+}
 
 type EssentialPath []protocol.EdgeId
 
