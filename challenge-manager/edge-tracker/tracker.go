@@ -12,7 +12,6 @@ import (
 	"time"
 
 	protocol "github.com/OffchainLabs/bold/chain-abstraction"
-	challengetree "github.com/OffchainLabs/bold/challenge-manager/challenge-tree"
 	"github.com/OffchainLabs/bold/containers"
 	"github.com/OffchainLabs/bold/containers/fsm"
 	"github.com/OffchainLabs/bold/containers/option"
@@ -40,13 +39,7 @@ func init() {
 	srvlog.SetHandler(log.StreamHandler(os.Stdout, log.LogfmtFormat()))
 }
 
-// ConfirmationMetadataChecker defines a struct which can retrieve information about
-// an edge to determine if it can be confirmed via different means. For example,
-// checking if a confirmed edge exists that claims a specified edge id as its claim id,
-// or retrieving the cumulative, honest path timer for an edge and its honest ancestors.
-// This information is used in order to confirm edges onchain.
-type RoyalChallengeWriter interface {
-	RoyalChallengeReader
+type ChallengeWriter interface {
 	AddVerifiedHonestEdge(
 		ctx context.Context, verifiedHonest protocol.VerifiedRoyalEdge,
 	) error
@@ -55,7 +48,7 @@ type RoyalChallengeWriter interface {
 		challengedAssertionHash protocol.AssertionHash,
 		essentialNodeId protocol.EdgeId,
 		confirmationThreshold uint64,
-	) (confirmable bool, essentialPaths []challengetree.EssentialPath, timer uint64, err error)
+	) (confirmable bool, essentialPaths [][]protocol.ReadOnlyEdge, timer uint64, err error)
 }
 
 type ChallengeTracker interface {
@@ -116,7 +109,7 @@ type Tracker struct {
 	validatorName               string
 	chain                       protocol.Protocol
 	stateProvider               l2stateprovider.Provider
-	chainWatcher                RoyalChallengeWriter
+	chainWatcher                ChallengeWriter
 	challengeManager            ChallengeTracker
 	associatedAssertionMetadata *AssociatedAssertionMetadata
 	challengeConfirmer          *challengeConfirmer
@@ -127,7 +120,7 @@ func New(
 	edge protocol.SpecEdge,
 	chain protocol.Protocol,
 	stateProvider l2stateprovider.Provider,
-	chainWatcher RoyalChallengeWriter,
+	chainWatcher ChallengeWriter,
 	challengeManager ChallengeTracker,
 	assertionCreationInfo *AssociatedAssertionMetadata,
 	opts ...Opt,
@@ -154,7 +147,7 @@ func New(
 	if err != nil {
 		return nil, err
 	}
-	tr.challengeConfirmer = newChallengeConfirmer(chainWatcher, chalManager, chain.Backend(), challengeManager.BlockTimes(), tr.validatorName)
+	tr.challengeConfirmer = newChallengeConfirmer(chalManager, chain.Backend(), challengeManager.BlockTimes(), tr.validatorName)
 	fsm, err := newEdgeTrackerFsm(
 		EdgeStarted,
 		tr.fsmOpts...,
@@ -174,7 +167,7 @@ func (et *Tracker) EdgeId() protocol.EdgeId {
 	return et.edge.Id()
 }
 
-func (et *Tracker) Watcher() RoyalChallengeWriter {
+func (et *Tracker) Watcher() ChallengeWriter {
 	return et.chainWatcher
 }
 
@@ -389,6 +382,8 @@ func (et *Tracker) ShouldDespawn(ctx context.Context) bool {
 		srvlog.Info("Claimed assertion by edge confirmed, can now despawn edge", fields)
 		return true
 	}
+
+	// TODO: Add a condition that should only act if the path to closest confirmable is < T.
 	return false
 }
 
@@ -413,14 +408,15 @@ func (et *Tracker) uniqueTrackerLogFields() log.Ctx {
 }
 
 func (et *Tracker) tryToConfirmEdge(ctx context.Context) (bool, error) {
-	// If the edge is not a root, block challenge edge, we have nothing to do here.
-	if !IsRootBlockChallengeEdge(et.edge) {
+	// We only need to confirm essential edges aside from proof edges in the protocol.
+	if !isEssentialNode(et.edge) {
 		return false, nil
 	}
 	status, err := et.edge.Status(ctx)
 	if err != nil {
 		return false, errors.Wrap(err, "could not get edge status")
 	}
+	// We exit early if already confirmed.
 	if status == protocol.EdgeConfirmed {
 		return true, nil
 	}
@@ -438,6 +434,8 @@ func (et *Tracker) tryToConfirmEdge(ctx context.Context) (bool, error) {
 		return false, errors.Wrap(err, "could not check the challenge period length")
 	}
 	start := time.Now()
+
+	// We check if the essential node is indeed confirmable.
 	isConfirmable, essentialPaths, timer, err := et.chainWatcher.IsConfirmableEssentialNode(
 		ctx,
 		assertionHash,
@@ -449,11 +447,19 @@ func (et *Tracker) tryToConfirmEdge(ctx context.Context) (bool, error) {
 		srvlog.Error("Could not check if essential node is confirmable")
 		return false, errors.Wrap(err, "not check if essential node is confirmable")
 	}
-	end := time.Since(start)
-	_ = end
-	_ = essentialPaths
-	_ = timer
+	fields["elapsed"] = time.Since(start)
+	fields["computedTimer"] = timer
+	srvlog.Info("Essential node is confirmable, now triggering confirmation job")
 	if isConfirmable {
+		if err = et.challengeConfirmer.confirmEssentialNode(
+			ctx,
+			assertionHash,
+			et.edge,
+			essentialPaths,
+			chalPeriod,
+		); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 	return false, nil
@@ -873,6 +879,10 @@ func canOneStepProve(ctx context.Context, edge protocol.SpecEdge) (bool, error) 
 	challengeLevel := edge.GetChallengeLevel()
 	totalChallengeLevels := edge.GetTotalChallengeLevels(ctx)
 	return end-start == 1 && challengeLevel.Uint8() == totalChallengeLevels-1, nil
+}
+
+func isEssentialNode(edge protocol.ReadOnlyEdge) bool {
+	return edge.ClaimId().IsSome()
 }
 
 func IsRootBlockChallengeEdge(edge protocol.ReadOnlyEdge) bool {

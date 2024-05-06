@@ -414,7 +414,7 @@ func (w *Watcher) IsConfirmableEssentialNode(
 	challengedAssertionHash protocol.AssertionHash,
 	essentialNodeId protocol.EdgeId,
 	confirmationThreshold uint64,
-) (confirmable bool, essentialPaths []challengetree.EssentialPath, timer uint64, err error) {
+) (confirmable bool, essentialPaths [][]protocol.ReadOnlyEdge, timer uint64, err error) {
 	chal, ok := w.challenges.TryGet(challengedAssertionHash)
 	if !ok {
 		err = fmt.Errorf(
@@ -436,7 +436,7 @@ func (w *Watcher) IsConfirmableEssentialNode(
 		err = fmt.Errorf("could not get essential node with id %#x", essentialNodeId.Hash)
 		return
 	}
-	confirmable, essentialPaths, timer, err = chal.honestEdgeTree.IsConfirmableEssentialNode(
+	isConfirmable, paths, computedTimer, err := chal.honestEdgeTree.IsConfirmableEssentialNode(
 		ctx,
 		challengetree.IsConfirmableArgs{
 			EssentialNode:         essentialNode.Id(),
@@ -444,6 +444,23 @@ func (w *Watcher) IsConfirmableEssentialNode(
 			ConfirmationThreshold: confirmationThreshold,
 		},
 	)
+	if err != nil {
+		return
+	}
+	confirmable = isConfirmable
+	timer = computedTimer
+	essentialPaths = make([][]protocol.ReadOnlyEdge, len(paths))
+	for i, path := range paths {
+		essentialPaths[i] = make([]protocol.ReadOnlyEdge, len(path))
+		for j, edgeId := range path {
+			edge, ok := chal.honestEdgeTree.GetEdge(edgeId)
+			if !ok {
+				err = fmt.Errorf("could not get edge with id %#x", edgeId.Hash)
+				return
+			}
+			essentialPaths[i][j] = edge
+		}
+	}
 	return
 }
 
