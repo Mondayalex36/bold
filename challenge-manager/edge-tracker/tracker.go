@@ -39,7 +39,7 @@ func init() {
 	srvlog.SetHandler(log.StreamHandler(os.Stdout, log.LogfmtFormat()))
 }
 
-type ChallengeWriter interface {
+type HonestChallengeTreeReader interface {
 	AddVerifiedHonestEdge(
 		ctx context.Context, verifiedHonest protocol.VerifiedRoyalEdge,
 	) error
@@ -49,6 +49,11 @@ type ChallengeWriter interface {
 		essentialNodeId protocol.EdgeId,
 		confirmationThreshold uint64,
 	) (confirmable bool, essentialPaths [][]protocol.ReadOnlyEdge, timer uint64, err error)
+	PathWeightToClosestEssentialAncestor(
+		ctx context.Context,
+		challengedAssertionHash protocol.AssertionHash,
+		edge protocol.ReadOnlyEdge,
+	) (uint64, error)
 }
 
 type ChallengeTracker interface {
@@ -109,7 +114,7 @@ type Tracker struct {
 	validatorName               string
 	chain                       protocol.Protocol
 	stateProvider               l2stateprovider.Provider
-	chainWatcher                ChallengeWriter
+	chainWatcher                HonestChallengeTreeReader
 	challengeManager            ChallengeTracker
 	associatedAssertionMetadata *AssociatedAssertionMetadata
 	challengeConfirmer          *challengeConfirmer
@@ -120,7 +125,7 @@ func New(
 	edge protocol.SpecEdge,
 	chain protocol.Protocol,
 	stateProvider l2stateprovider.Provider,
-	chainWatcher ChallengeWriter,
+	chainWatcher HonestChallengeTreeReader,
 	challengeManager ChallengeTracker,
 	assertionCreationInfo *AssociatedAssertionMetadata,
 	opts ...Opt,
@@ -167,7 +172,7 @@ func (et *Tracker) EdgeId() protocol.EdgeId {
 	return et.edge.Id()
 }
 
-func (et *Tracker) Watcher() ChallengeWriter {
+func (et *Tracker) Watcher() HonestChallengeTreeReader {
 	return et.chainWatcher
 }
 
@@ -355,7 +360,9 @@ func (et *Tracker) Act(ctx context.Context) error {
 }
 
 // ShouldDespawn checks if an edge tracker should despawn and no longer act.
-// This is true an edge's claimed assertion is confirmed.
+// If the edge is already confirmed, no need to keep defending it.
+// Otherwise, if the weight of the path from the edge to its closest essential ancestor is
+// greater than or equal to the confirmation threshold, it is safe to stop defending it.
 func (et *Tracker) ShouldDespawn(ctx context.Context) bool {
 	fields := et.uniqueTrackerLogFields()
 	status, err := et.edge.Status(ctx)
@@ -367,24 +374,37 @@ func (et *Tracker) ShouldDespawn(ctx context.Context) bool {
 	if status == protocol.EdgeConfirmed {
 		return true
 	}
-	claimedAssertion, err := et.chain.AssertionStatus(
+	assertionHash, err := et.edge.AssertionHash(ctx)
+	if err != nil {
+		fields["err"] = err
+		srvlog.Error("Could not get assertion hash", fields)
+		return false
+	}
+	manager, err := et.chain.SpecChallengeManager(ctx)
+	if err != nil {
+		fields["err"] = err
+		srvlog.Error("Could not get challenge manager", fields)
+		return false
+	}
+	chalPeriod, err := manager.ChallengePeriodBlocks(ctx)
+	if err != nil {
+		fields["err"] = err
+		srvlog.Error("Could not get challenge period blocks", fields)
+		return false
+	}
+	// We should only defend an edge if the path from it to its closest essential edge
+	// is less than the confirmation threshold.
+	pathWeight, err := et.chainWatcher.PathWeightToClosestEssentialAncestor(
 		ctx,
-		protocol.AssertionHash{
-			Hash: et.associatedAssertionMetadata.ClaimedAssertionHash,
-		},
+		assertionHash,
+		et.edge,
 	)
 	if err != nil {
 		fields["err"] = err
-		srvlog.Error("Could not get claimed assertion status", fields)
+		srvlog.Error("Could not get path weight to closest essential ancestor", fields)
 		return false
 	}
-	if claimedAssertion == protocol.AssertionConfirmed {
-		srvlog.Info("Claimed assertion by edge confirmed, can now despawn edge", fields)
-		return true
-	}
-
-	// TODO: Add a condition that should only act if the path to closest confirmable is < T.
-	return false
+	return pathWeight >= chalPeriod
 }
 
 func (et *Tracker) uniqueTrackerLogFields() log.Ctx {
@@ -433,9 +453,8 @@ func (et *Tracker) tryToConfirmEdge(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, errors.Wrap(err, "could not check the challenge period length")
 	}
-	start := time.Now()
-
 	// We check if the essential node is indeed confirmable.
+	start := time.Now()
 	isConfirmable, essentialPaths, timer, err := et.chainWatcher.IsConfirmableEssentialNode(
 		ctx,
 		assertionHash,
@@ -449,17 +468,22 @@ func (et *Tracker) tryToConfirmEdge(ctx context.Context) (bool, error) {
 	}
 	fields["elapsed"] = time.Since(start)
 	fields["computedTimer"] = timer
-	srvlog.Info("Essential node is confirmable, now triggering confirmation job")
+	fields["confirmable"] = isConfirmable
+	srvlog.Info("Checking if essential edge is confirmable", fields)
 	if isConfirmable {
-		if err = et.challengeConfirmer.confirmEssentialNode(
+		if err := et.challengeConfirmer.confirmEssentialNode(
 			ctx,
 			assertionHash,
 			et.edge,
 			essentialPaths,
 			chalPeriod,
 		); err != nil {
-			return false, err
+			return false, errors.Wrap(
+				err,
+				"could not complete confirmation job for essential edge",
+			)
 		}
+		// The edge is now confirmed.
 		return true, nil
 	}
 	return false, nil
